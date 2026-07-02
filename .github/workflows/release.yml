@@ -1,0 +1,161 @@
+name: Build and Package DeepSeek Studio Pro
+
+on:
+  push:
+    tags:
+      - 'v*'               # запуск при публикации тега v0.7.2, v1.0.0 и т.д.
+  workflow_dispatch:        # возможность запустить вручную из интерфейса GitHub
+
+env:
+  APP_NAME: DeepSeekStudio
+  PRODUCT_VERSION: 0.7.2    # можно динамически извлекать из тега
+
+jobs:
+  # ----- Windows NSIS -----
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Установка Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Кэширование Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Загрузка ресурсов (ComfyUI Portable, Whisper, модели)
+        shell: pwsh
+        run: ./scripts/download-resources.ps1
+        env:
+          # Ссылки на приватные архивы можно передать через секреты
+          RESOURCES_URL_COMFYUI: ${{ secrets.RESOURCES_URL_COMFYUI }}
+          RESOURCES_URL_WHISPER: ${{ secrets.RESOURCES_URL_WHISPER }}
+
+      - name: Сборка фронтенда (Next.js export)
+        run: |
+          cd src
+          npm ci
+          npm run build   # генерирует папку out/
+
+      - name: Сборка Tauri (релизный бинарник)
+        run: |
+          cd src-tauri
+          cargo tauri build --release   # создаст .exe и .msi, но нам нужен только exe и ресурсы
+        # Примечание: можно заменить на cargo build --release, если tauri.conf настроен соответствующим образом
+
+      - name: Подготовка каталога для NSIS
+        shell: pwsh
+        run: |
+          # Копируем полученный .exe и все ресурсные папки в build/DeepSeekStudio
+          $exe = Get-ChildItem -Path src-tauri/target/release -Filter "deepseek-studio.exe" -Recurse | Select -First 1
+          New-Item -ItemType Directory -Force build/DeepSeekStudio
+          Copy-Item $exe.FullName build/DeepSeekStudio/DeepSeekStudio.exe
+          Copy-Item -Recurse comfyui-portable build/DeepSeekStudio/
+          Copy-Item -Recurse whisper build/DeepSeekStudio/
+          Copy-Item -Recurse workflows build/DeepSeekStudio/
+          Copy-Item -Recurse licenses build/DeepSeekStudio/
+
+      - name: Установка NSIS
+        shell: pwsh
+        run: choco install nsis --version 3.09 -y
+
+      - name: Установка плагина nsProcess
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/neoremind/nsprocess/releases/download/v1.6/nsProcess.zip" -OutFile nsProcess.zip
+          Expand-Archive nsProcess.zip -DestinationPath nsProcess
+          Copy-Item "nsProcess/Plugins/x86-unicode/nsProcess.dll" "C:\Program Files (x86)\NSIS\Plugins\x86-unicode\"
+
+      - name: Сборка установщика (NSIS)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\NSIS\makensis.exe" .\scripts\installer.nsi
+        # Результат: DeepSeekStudio_Setup_0.7.2.exe
+
+      - name: Загрузка артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekStudio-Windows-Setup
+          path: DeepSeekStudio_Setup_*.exe
+
+  # ----- macOS DMG -----
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Установка Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Кэширование Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Загрузка ресурсов
+        shell: bash
+        run: ./scripts/download-resources.sh
+        env:
+          RESOURCES_URL_COMFYUI: ${{ secrets.RESOURCES_URL_COMFYUI }}
+          RESOURCES_URL_WHISPER: ${{ secrets.RESOURCES_URL_WHISPER }}
+
+      - name: Сборка фронтенда
+        run: |
+          cd src
+          npm ci
+          npm run build
+
+      - name: Сборка Tauri (.app)
+        run: |
+          cd src-tauri
+          cargo tauri build --release   # создаст .app внутри target/release/bundle/macos/
+        # Примечание: tauri build автоматически подписывает ad-hoc (без Developer ID)
+
+      - name: Установка create-dmg
+        run: brew install create-dmg
+
+      - name: Создание DMG
+        run: ./scripts/create-dmg.sh
+        env:
+          APP_NAME: "DeepSeek Studio Pro"
+          VERSION: ${{ env.PRODUCT_VERSION }}
+
+      - name: Загрузка артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekStudio-macOS-DMG
+          path: DeepSeekStudio_*.dmg
